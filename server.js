@@ -15,7 +15,11 @@ const app = express();
 const server = http.createServer(app);
 const io = socketIo(server, {
   cors: {
-    origin: process.env.FRONTEND_URL || "https://planwithpoker.net",
+    origin: [
+      "https://www.planwithpoker.us",
+      "https://planwithpoker.us",
+      "https://scrum-poker-frontend-chi.vercel.app"
+    ],
     methods: ["GET", "POST"],
     credentials: true
   }
@@ -29,9 +33,10 @@ app.use(helmet({
 // CORS middleware
 app.use(cors({
   origin: [
-    process.env.FRONTEND_URL || "https://planwithpoker.net",
-    "http://localhost:3000", // For development
-    "https://localhost:3000"
+    "https://www.planwithpoker.us",
+    "https://planwithpoker.us", 
+    "https://scrum-poker-frontend-chi.vercel.app", // Current Vercel URL
+    "http://localhost:3000" // For development
   ],
   credentials: true
 }));
