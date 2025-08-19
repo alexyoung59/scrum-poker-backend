@@ -334,7 +334,7 @@ app.get('/api/rooms/:id', authenticateToken, async (req, res) => {
   }
 });
 
-// Also add the join room route
+// Update both join room routes in server.js
 app.post('/api/rooms/:id/join', authenticateToken, async (req, res) => {
   try {
     const { role = 'participant' } = req.body;
@@ -344,24 +344,27 @@ app.post('/api/rooms/:id/join', authenticateToken, async (req, res) => {
       return res.status(404).json({ error: 'Room not found' });
     }
 
-    // Check if room is full
     if (room.participants.length >= room.maxParticipants) {
       return res.status(400).json({ error: 'Room is full' });
     }
 
-    // Check if user is already in room
     const isAlreadyParticipant = room.participants.some(p => p.userId.toString() === req.user.id);
     if (isAlreadyParticipant) {
       return res.status(400).json({ error: 'Already in room' });
     }
 
-    // Add user to room
     room.participants.push({ userId: req.user.id, role });
     await room.save();
 
-    // Populate the room data
     await room.populate('hostId', 'name email');
     await room.populate('participants.userId', 'name email');
+
+    // Emit updated room data to all users in the room
+    io.to(req.params.id).emit('room_updated', {
+      roomId: req.params.id,
+      room: room,
+      participants: room.participants
+    });
 
     res.json({ message: 'Joined room successfully', room });
   } catch (error) {
@@ -370,56 +373,45 @@ app.post('/api/rooms/:id/join', authenticateToken, async (req, res) => {
   }
 });
 
-// Add this route after the existing room routes
-app.post('/api/rooms/join-by-code', 
-  authenticateToken,
-  validateInput([
-    body('inviteCode').trim().isLength({ min: 6, max: 6 }).withMessage('Invite code must be 6 characters'),
-    body('role').optional().isIn(['participant', 'observer']).withMessage('Invalid role')
-  ]),
-  async (req, res) => {
-    try {
-      const { inviteCode, role = 'participant' } = req.body;
-      
-      // Find room by invite code
-      const room = await Room.findOne({ inviteCode: inviteCode.toUpperCase() });
-      
-      if (!room) {
-        return res.status(404).json({ error: 'Invalid invite code' });
-      }
-
-      // Check if room is full
-      if (room.participants.length >= room.maxParticipants) {
-        return res.status(400).json({ error: 'Room is full' });
-      }
-
-      // Check if user is already in room
-      const isAlreadyParticipant = room.participants.some(p => p.userId.toString() === req.user.id);
-      if (isAlreadyParticipant) {
-        return res.status(400).json({ error: 'Already in room' });
-      }
-
-      // Add user to room
-      room.participants.push({ userId: req.user.id, role });
-      await room.save();
-
-      // Populate the room data
-      await room.populate('hostId', 'name email');
-      await room.populate('participants.userId', 'name email');
-
-      // Emit to room that user joined
-      io.to(room._id.toString()).emit('user_joined', {
-        user: { id: req.user.id, name: req.user.name, email: req.user.email },
-        role
-      });
-
-      res.json(room);
-    } catch (error) {
-      console.error('Join by code error:', error);
-      res.status(500).json({ error: 'Internal server error' });
+// Also update the join-by-code route similarly
+app.post('/api/rooms/join-by-code', authenticateToken, async (req, res) => {
+  try {
+    const { inviteCode, role = 'participant' } = req.body;
+    
+    const room = await Room.findOne({ inviteCode: inviteCode.toUpperCase() });
+    
+    if (!room) {
+      return res.status(404).json({ error: 'Invalid invite code' });
     }
+
+    if (room.participants.length >= room.maxParticipants) {
+      return res.status(400).json({ error: 'Room is full' });
+    }
+
+    const isAlreadyParticipant = room.participants.some(p => p.userId.toString() === req.user.id);
+    if (isAlreadyParticipant) {
+      return res.status(400).json({ error: 'Already in room' });
+    }
+
+    room.participants.push({ userId: req.user.id, role });
+    await room.save();
+
+    await room.populate('hostId', 'name email');
+    await room.populate('participants.userId', 'name email');
+
+    // Emit updated room data to all users in the room
+    io.to(room._id.toString()).emit('room_updated', {
+      roomId: room._id.toString(),
+      room: room,
+      participants: room.participants
+    });
+
+    res.json(room);
+  } catch (error) {
+    console.error('Join by code error:', error);
+    res.status(500).json({ error: 'Internal server error' });
   }
-);
+});
 
 // Session Routes - Replace the validation part
 app.post('/api/sessions', 
@@ -612,16 +604,52 @@ io.use((socket, next) => {
 io.on('connection', (socket) => {
   console.log(`User ${socket.user.name} connected`);
 
-  socket.on('join_room', (roomId) => {
+  socket.on('join_room', async (roomId) => {
     socket.join(roomId);
     socket.roomId = roomId;
-    socket.to(roomId).emit('user_connected', { user: socket.user });
+    
+    // Get updated room data and broadcast to all users in room
+    try {
+      const room = await Room.findById(roomId)
+        .populate('hostId', 'name email')
+        .populate('participants.userId', 'name email');
+      
+      if (room) {
+        // Send updated room data to all users in the room
+        io.to(roomId).emit('room_updated', {
+          roomId: roomId,
+          room: room,
+          participants: room.participants
+        });
+        
+        // Also send user connected event
+        socket.to(roomId).emit('user_connected', { user: socket.user });
+      }
+    } catch (error) {
+      console.error('Error updating room on join:', error);
+    }
+  });
+
+  socket.on('leave_room', (roomId) => {
+    socket.leave(roomId);
+    socket.to(roomId).emit('user_disconnected', { user: socket.user });
   });
 
   socket.on('disconnect', () => {
+    console.log(`User ${socket.user.name} disconnected`);
     if (socket.roomId) {
       socket.to(socket.roomId).emit('user_disconnected', { user: socket.user });
     }
+  });
+
+  // Handle real-time voting
+  socket.on('vote_cast', (data) => {
+    console.log(`Vote cast by ${socket.user.name}:`, data);
+    socket.to(socket.roomId).emit('vote_updated', {
+      sessionId: data.sessionId,
+      userId: socket.user.id,
+      hasVoted: true
+    });
   });
 });
 
