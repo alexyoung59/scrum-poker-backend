@@ -370,6 +370,57 @@ app.post('/api/rooms/:id/join', authenticateToken, async (req, res) => {
   }
 });
 
+// Add this route after the existing room routes
+app.post('/api/rooms/join-by-code', 
+  authenticateToken,
+  validateInput([
+    body('inviteCode').trim().isLength({ min: 6, max: 6 }).withMessage('Invite code must be 6 characters'),
+    body('role').optional().isIn(['participant', 'observer']).withMessage('Invalid role')
+  ]),
+  async (req, res) => {
+    try {
+      const { inviteCode, role = 'participant' } = req.body;
+      
+      // Find room by invite code
+      const room = await Room.findOne({ inviteCode: inviteCode.toUpperCase() });
+      
+      if (!room) {
+        return res.status(404).json({ error: 'Invalid invite code' });
+      }
+
+      // Check if room is full
+      if (room.participants.length >= room.maxParticipants) {
+        return res.status(400).json({ error: 'Room is full' });
+      }
+
+      // Check if user is already in room
+      const isAlreadyParticipant = room.participants.some(p => p.userId.toString() === req.user.id);
+      if (isAlreadyParticipant) {
+        return res.status(400).json({ error: 'Already in room' });
+      }
+
+      // Add user to room
+      room.participants.push({ userId: req.user.id, role });
+      await room.save();
+
+      // Populate the room data
+      await room.populate('hostId', 'name email');
+      await room.populate('participants.userId', 'name email');
+
+      // Emit to room that user joined
+      io.to(room._id.toString()).emit('user_joined', {
+        user: { id: req.user.id, name: req.user.name, email: req.user.email },
+        role
+      });
+
+      res.json(room);
+    } catch (error) {
+      console.error('Join by code error:', error);
+      res.status(500).json({ error: 'Internal server error' });
+    }
+  }
+);
+
 // Session Routes - Replace the validation part
 app.post('/api/sessions', 
   authenticateToken,
