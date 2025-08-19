@@ -370,6 +370,164 @@ app.post('/api/rooms/:id/join', authenticateToken, async (req, res) => {
   }
 });
 
+// Session Routes - Add after the room routes
+app.post('/api/sessions', 
+  authenticateToken,
+  validateInput([
+    body('roomId').isMongoId().withMessage('Invalid room ID'),
+    body('topic').trim().isLength({ min: 1, max: 200 }),
+    body('topicLink').optional().isURL().withMessage('Invalid URL')
+  ]),
+  async (req, res) => {
+    try {
+      const { roomId, topic, topicLink } = req.body;
+
+      // Verify user is in room
+      const room = await Room.findById(roomId);
+      if (!room) {
+        return res.status(404).json({ error: 'Room not found' });
+      }
+
+      const isParticipant = room.participants.some(p => p.userId.toString() === req.user.id);
+      const isHost = room.hostId.toString() === req.user.id;
+      
+      if (!isParticipant && !isHost) {
+        return res.status(403).json({ error: 'Access denied' });
+      }
+
+      // End any active session in this room
+      await Session.updateMany(
+        { roomId, isActive: true }, 
+        { isActive: false, endTime: new Date() }
+      );
+
+      // Create new session
+      const session = new Session({ 
+        roomId, 
+        topic, 
+        topicLink: topicLink || undefined 
+      });
+      
+      await session.save();
+
+      // Emit to room that new session started
+      io.to(roomId).emit('session_started', session);
+
+      res.status(201).json(session);
+    } catch (error) {
+      console.error('Create session error:', error);
+      res.status(500).json({ error: 'Internal server error' });
+    }
+  }
+);
+
+app.post('/api/sessions/:id/vote', 
+  authenticateToken,
+  validateInput([
+    body('vote').notEmpty().withMessage('Vote is required')
+  ]),
+  async (req, res) => {
+    try {
+      const { vote } = req.body;
+      const session = await Session.findById(req.params.id);
+
+      if (!session || !session.isActive) {
+        return res.status(404).json({ error: 'Session not found or inactive' });
+      }
+
+      // Verify user is in room
+      const room = await Room.findById(session.roomId);
+      const participant = room.participants.find(p => p.userId.toString() === req.user.id);
+      
+      if (!participant || participant.role !== 'participant') {
+        return res.status(403).json({ error: 'Only participants can vote' });
+      }
+
+      // Update or add vote
+      const existingVoteIndex = session.votes.findIndex(v => v.userId.toString() === req.user.id);
+      
+      if (existingVoteIndex >= 0) {
+        session.votes[existingVoteIndex].vote = vote;
+        session.votes[existingVoteIndex].timestamp = new Date();
+      } else {
+        session.votes.push({ userId: req.user.id, vote });
+      }
+
+      await session.save();
+
+      // Emit vote update to room
+      io.to(session.roomId.toString()).emit('vote_updated', {
+        sessionId: session._id,
+        userId: req.user.id,
+        hasVoted: true
+      });
+
+      res.json({ message: 'Vote recorded' });
+    } catch (error) {
+      console.error('Vote error:', error);
+      res.status(500).json({ error: 'Internal server error' });
+    }
+  }
+);
+
+app.post('/api/sessions/:id/reveal', 
+  authenticateToken,
+  async (req, res) => {
+    try {
+      const session = await Session.findById(req.params.id).populate('votes.userId', 'name email');
+
+      if (!session || !session.isActive) {
+        return res.status(404).json({ error: 'Session not found or inactive' });
+      }
+
+      // Verify user is host
+      const room = await Room.findById(session.roomId);
+      if (room.hostId.toString() !== req.user.id) {
+        return res.status(403).json({ error: 'Only host can reveal votes' });
+      }
+
+      // Calculate stats
+      const numericVotes = session.votes
+        .map(v => v.vote)
+        .filter(vote => !isNaN(vote) && vote !== '?' && vote !== '☕')
+        .map(Number);
+
+      const average = numericVotes.length > 0 
+        ? (numericVotes.reduce((sum, vote) => sum + vote, 0) / numericVotes.length).toFixed(1)
+        : null;
+
+      const voteDistribution = {};
+      session.votes.forEach(v => {
+        voteDistribution[v.vote] = (voteDistribution[v.vote] || 0) + 1;
+      });
+
+      const consensus = Object.keys(voteDistribution).length === 1;
+      
+      // Update session
+      session.finalVote = average ? average.toString() : 'No numeric votes';
+      session.consensus = consensus;
+      session.endTime = new Date();
+      session.isActive = false;
+      
+      await session.save();
+
+      const stats = { average, voteDistribution, consensus };
+
+      // Emit reveal to room
+      io.to(session.roomId.toString()).emit('votes_revealed', {
+        sessionId: session._id,
+        votes: session.votes,
+        stats
+      });
+
+      res.json({ session, stats });
+    } catch (error) {
+      console.error('Reveal votes error:', error);
+      res.status(500).json({ error: 'Internal server error' });
+    }
+  }
+);
+
 // ===== SOCKET.IO =====
 
 io.use((socket, next) => {
