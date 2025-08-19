@@ -308,6 +308,68 @@ app.post('/api/rooms',
   }
 );
 
+// Add this route after the POST /api/rooms route
+app.get('/api/rooms/:id', authenticateToken, async (req, res) => {
+  try {
+    const room = await Room.findById(req.params.id)
+      .populate('hostId', 'name email')
+      .populate('participants.userId', 'name email');
+
+    if (!room) {
+      return res.status(404).json({ error: 'Room not found' });
+    }
+
+    // Check if user is participant or host
+    const isParticipant = room.participants.some(p => p.userId._id.toString() === req.user.id);
+    const isHost = room.hostId._id.toString() === req.user.id;
+
+    if (!isParticipant && !isHost) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    res.json(room);
+  } catch (error) {
+    console.error('Get room error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Also add the join room route
+app.post('/api/rooms/:id/join', authenticateToken, async (req, res) => {
+  try {
+    const { role = 'participant' } = req.body;
+    const room = await Room.findById(req.params.id);
+
+    if (!room) {
+      return res.status(404).json({ error: 'Room not found' });
+    }
+
+    // Check if room is full
+    if (room.participants.length >= room.maxParticipants) {
+      return res.status(400).json({ error: 'Room is full' });
+    }
+
+    // Check if user is already in room
+    const isAlreadyParticipant = room.participants.some(p => p.userId.toString() === req.user.id);
+    if (isAlreadyParticipant) {
+      return res.status(400).json({ error: 'Already in room' });
+    }
+
+    // Add user to room
+    room.participants.push({ userId: req.user.id, role });
+    await room.save();
+
+    // Populate the room data
+    await room.populate('hostId', 'name email');
+    await room.populate('participants.userId', 'name email');
+
+    res.json({ message: 'Joined room successfully', room });
+  } catch (error) {
+    console.error('Join room error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 // ===== SOCKET.IO =====
 
 io.use((socket, next) => {
