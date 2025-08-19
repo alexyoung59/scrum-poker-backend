@@ -370,13 +370,21 @@ app.post('/api/rooms/:id/join', authenticateToken, async (req, res) => {
   }
 });
 
-// Session Routes - Add after the room routes
+// Session Routes - Replace the validation part
 app.post('/api/sessions', 
   authenticateToken,
   validateInput([
     body('roomId').isMongoId().withMessage('Invalid room ID'),
-    body('topic').trim().isLength({ min: 1, max: 200 }),
-    body('topicLink').optional().isURL().withMessage('Invalid URL')
+    body('topic').trim().isLength({ min: 1, max: 200 }).withMessage('Topic must be 1-200 characters'),
+    body('topicLink').optional().custom((value) => {
+      if (!value || value.trim() === '') return true; // Allow empty
+      try {
+        new URL(value);
+        return true;
+      } catch {
+        throw new Error('Invalid URL format');
+      }
+    })
   ]),
   async (req, res) => {
     try {
@@ -401,14 +409,20 @@ app.post('/api/sessions',
         { isActive: false, endTime: new Date() }
       );
 
-      // Create new session
-      const session = new Session({ 
+      // Create new session - handle empty topicLink
+      const sessionData = { 
         roomId, 
-        topic, 
-        topicLink: topicLink || undefined 
-      });
+        topic: topic.trim()
+      };
       
+      if (topicLink && topicLink.trim()) {
+        sessionData.topicLink = topicLink.trim();
+      }
+      
+      const session = new Session(sessionData);
       await session.save();
+
+      console.log('Session created:', session); // Debug log
 
       // Emit to room that new session started
       io.to(roomId).emit('session_started', session);
