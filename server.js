@@ -5,8 +5,7 @@ const socketIo = require('socket.io');
 const cors = require('cors');
 const helmet = require('helmet');
 const mongoose = require('mongoose');
-const jwt = require('jsonwebtoken');
-const bcrypt = require('bcryptjs');
+const cron = require('node-cron');
 const rateLimit = require('express-rate-limit');
 const { body, validationResult } = require('express-validator');
 require('dotenv').config();
@@ -91,35 +90,24 @@ connectDB();
 
 // ===== MONGOOSE SCHEMAS =====
 
-const userSchema = new mongoose.Schema({
-  email: { type: String, required: true, unique: true },
-  password: { type: String, required: true },
-  name: { type: String, required: true },
-  createdAt: { type: Date, default: Date.now },
-  lastLogin: { type: Date, default: Date.now }
-});
-
-userSchema.pre('save', async function(next) {
-  if (!this.isModified('password')) return next();
-  this.password = await bcrypt.hash(this.password, 12);
-  next();
-});
-
-const User = mongoose.model('User', userSchema);
-
 const roomSchema = new mongoose.Schema({
   name: { type: String, required: true },
   description: { type: String },
-  hostId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+  hostName: { type: String, required: true },
+  hostAnonymousId: { type: String, required: true },
+  hostSocketId: { type: String },
   participants: [{
-    userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+    name: { type: String, required: true },
+    socketId: { type: String },
+    anonymousId: { type: String, required: true },
     role: { type: String, enum: ['participant', 'observer'], default: 'participant' },
     joinedAt: { type: Date, default: Date.now }
   }],
   isActive: { type: Boolean, default: true },
   inviteCode: { type: String, unique: true },
   maxParticipants: { type: Number, default: 30 },
-  createdAt: { type: Date, default: Date.now }
+  createdAt: { type: Date, default: Date.now },
+  lastActivity: { type: Date, default: Date.now }
 });
 
 const Room = mongoose.model('Room', roomSchema);
@@ -134,7 +122,8 @@ const sessionSchema = new mongoose.Schema({
   consensus: { type: Boolean },
   isActive: { type: Boolean, default: true },
   votes: [{
-    userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+    participantName: { type: String, required: true },
+    anonymousId: { type: String, required: true },
     vote: { type: String },
     timestamp: { type: Date, default: Date.now }
   }]
@@ -144,19 +133,15 @@ const Session = mongoose.model('Session', sessionSchema);
 
 // ===== MIDDLEWARE =====
 
-const authenticateToken = (req, res, next) => {
-  const authHeader = req.headers['authorization'];
-  const token = authHeader && authHeader.split(' ')[1];
+// Generate or retrieve anonymous ID from request
+const getAnonymousId = (req, res, next) => {
+  req.anonymousId = req.headers['x-anonymous-id'] || generateAnonymousId();
+  req.userName = req.headers['x-user-name'] || 'Anonymous';
+  next();
+};
 
-  if (!token) {
-    return res.status(401).json({ error: 'Access token required' });
-  }
-
-  jwt.verify(token, process.env.JWT_SECRET, (err, user) => {
-    if (err) return res.status(403).json({ error: 'Invalid token' });
-    req.user = user;
-    next();
-  });
+const generateAnonymousId = () => {
+  return `anon_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
 };
 
 // Validation middleware
@@ -183,93 +168,19 @@ const generateInviteCode = () => {
 
 // ===== API ROUTES =====
 
-// Auth Routes
-app.post('/api/auth/register', 
-  validateInput([
-    body('email').isEmail().normalizeEmail(),
-    body('password').isLength({ min: 6 }),
-    body('name').trim().isLength({ min: 2, max: 50 })
-  ]),
-  async (req, res) => {
-    try {
-      const { email, password, name } = req.body;
-
-      const existingUser = await User.findOne({ email });
-      if (existingUser) {
-        return res.status(400).json({ error: 'User already exists' });
-      }
-
-      const user = new User({ email, password, name });
-      await user.save();
-
-      const token = jwt.sign(
-        { id: user._id, email: user.email, name: user.name },
-        process.env.JWT_SECRET,
-        { expiresIn: '7d' }
-      );
-
-      res.status(201).json({
-        token,
-        user: { id: user._id, email: user.email, name: user.name }
-      });
-    } catch (error) {
-      console.error('Registration error:', error);
-      res.status(500).json({ error: 'Internal server error' });
-    }
-  }
-);
-
-app.post('/api/auth/login',
-  validateInput([
-    body('email').isEmail().normalizeEmail(),
-    body('password').notEmpty()
-  ]),
-  async (req, res) => {
-    try {
-      const { email, password } = req.body;
-
-      const user = await User.findOne({ email });
-      if (!user) {
-        return res.status(400).json({ error: 'Invalid credentials' });
-      }
-
-      const isMatch = await bcrypt.compare(password, user.password);
-      if (!isMatch) {
-        return res.status(400).json({ error: 'Invalid credentials' });
-      }
-
-      user.lastLogin = new Date();
-      await user.save();
-
-      const token = jwt.sign(
-        { id: user._id, email: user.email, name: user.name },
-        process.env.JWT_SECRET,
-        { expiresIn: '7d' }
-      );
-
-      res.json({
-        token,
-        user: { id: user._id, email: user.email, name: user.name }
-      });
-    } catch (error) {
-      console.error('Login error:', error);
-      res.status(500).json({ error: 'Internal server error' });
-    }
-  }
-);
-
 // Room Routes
-app.get('/api/rooms', authenticateToken, async (req, res) => {
+app.get('/api/rooms', getAnonymousId, async (req, res) => {
   try {
-    const rooms = await Room.find({
-      $or: [
-        { hostId: req.user.id },
-        { 'participants.userId': req.user.id }
-      ]
-    })
-    .populate('hostId', 'name email')
-    .populate('participants.userId', 'name email')
-    .sort({ createdAt: -1 });
+    // Get all active rooms or filter by user's anonymousId if requested
+    const query = req.query.myRooms === 'true'
+      ? {
+          isActive: true,
+          'participants.anonymousId': req.anonymousId
+        }
+      : { isActive: true };
+
+    const rooms = await Room.find(query)
+      .sort({ lastActivity: -1, createdAt: -1 });
 
     res.json(rooms);
   } catch (error) {
@@ -278,27 +189,32 @@ app.get('/api/rooms', authenticateToken, async (req, res) => {
   }
 });
 
-app.post('/api/rooms', 
-  authenticateToken,
+app.post('/api/rooms',
+  getAnonymousId,
   validateInput([
     body('name').trim().isLength({ min: 3, max: 100 }),
-    body('description').optional().trim().isLength({ max: 500 })
+    body('description').optional().trim().isLength({ max: 500 }),
+    body('hostName').trim().isLength({ min: 2, max: 50 })
   ]),
   async (req, res) => {
     try {
-      const { name, description } = req.body;
-      
+      const { name, description, hostName } = req.body;
+
       const room = new Room({
         name,
         description,
-        hostId: req.user.id,
-        participants: [{ userId: req.user.id, role: 'participant' }],
-        inviteCode: generateInviteCode()
+        hostName: hostName || req.userName,
+        hostAnonymousId: req.anonymousId,
+        participants: [{
+          name: hostName || req.userName,
+          anonymousId: req.anonymousId,
+          role: 'participant'
+        }],
+        inviteCode: generateInviteCode(),
+        lastActivity: new Date()
       });
 
       await room.save();
-      await room.populate('hostId', 'name email');
-      await room.populate('participants.userId', 'name email');
 
       res.status(201).json(room);
     } catch (error) {
@@ -308,24 +224,17 @@ app.post('/api/rooms',
   }
 );
 
-// Add this route after the POST /api/rooms route
-app.get('/api/rooms/:id', authenticateToken, async (req, res) => {
+app.get('/api/rooms/:id', getAnonymousId, async (req, res) => {
   try {
-    const room = await Room.findById(req.params.id)
-      .populate('hostId', 'name email')
-      .populate('participants.userId', 'name email');
+    const room = await Room.findById(req.params.id);
 
     if (!room) {
       return res.status(404).json({ error: 'Room not found' });
     }
 
-    // Check if user is participant or host
-    const isParticipant = room.participants.some(p => p.userId._id.toString() === req.user.id);
-    const isHost = room.hostId._id.toString() === req.user.id;
-
-    if (!isParticipant && !isHost) {
-      return res.status(403).json({ error: 'Access denied' });
-    }
+    // Update lastActivity
+    room.lastActivity = new Date();
+    await room.save();
 
     res.json(room);
   } catch (error) {
@@ -334,88 +243,121 @@ app.get('/api/rooms/:id', authenticateToken, async (req, res) => {
   }
 });
 
-// Update both join room routes in server.js
-app.post('/api/rooms/:id/join', authenticateToken, async (req, res) => {
-  try {
-    const { role = 'participant' } = req.body;
-    const room = await Room.findById(req.params.id);
+app.post('/api/rooms/:id/join',
+  getAnonymousId,
+  validateInput([
+    body('name').trim().isLength({ min: 2, max: 50 }),
+    body('role').optional().isIn(['participant', 'observer'])
+  ]),
+  async (req, res) => {
+    try {
+      const { role = 'participant', name } = req.body;
+      const room = await Room.findById(req.params.id);
 
-    if (!room) {
-      return res.status(404).json({ error: 'Room not found' });
+      if (!room) {
+        return res.status(404).json({ error: 'Room not found' });
+      }
+
+      if (room.participants.length >= room.maxParticipants) {
+        return res.status(400).json({ error: 'Room is full' });
+      }
+
+      // Check if already in room by anonymousId
+      const existingParticipant = room.participants.find(
+        p => p.anonymousId === req.anonymousId
+      );
+
+      if (existingParticipant) {
+        // Update existing participant (reconnection case)
+        existingParticipant.name = name || existingParticipant.name;
+        existingParticipant.role = role;
+      } else {
+        // Add new participant
+        room.participants.push({
+          name: name || req.userName,
+          anonymousId: req.anonymousId,
+          role
+        });
+      }
+
+      room.lastActivity = new Date();
+      await room.save();
+
+      // Emit updated room data to all users in the room
+      io.to(req.params.id).emit('room_updated', {
+        roomId: req.params.id,
+        room: room,
+        participants: room.participants
+      });
+
+      res.json({ message: 'Joined room successfully', room });
+    } catch (error) {
+      console.error('Join room error:', error);
+      res.status(500).json({ error: 'Internal server error' });
     }
-
-    if (room.participants.length >= room.maxParticipants) {
-      return res.status(400).json({ error: 'Room is full' });
-    }
-
-    const isAlreadyParticipant = room.participants.some(p => p.userId.toString() === req.user.id);
-    if (isAlreadyParticipant) {
-      return res.status(400).json({ error: 'Already in room' });
-    }
-
-    room.participants.push({ userId: req.user.id, role });
-    await room.save();
-
-    await room.populate('hostId', 'name email');
-    await room.populate('participants.userId', 'name email');
-
-    // Emit updated room data to all users in the room
-    io.to(req.params.id).emit('room_updated', {
-      roomId: req.params.id,
-      room: room,
-      participants: room.participants
-    });
-
-    res.json({ message: 'Joined room successfully', room });
-  } catch (error) {
-    console.error('Join room error:', error);
-    res.status(500).json({ error: 'Internal server error' });
   }
-});
+);
 
-// Also update the join-by-code route similarly
-app.post('/api/rooms/join-by-code', authenticateToken, async (req, res) => {
-  try {
-    const { inviteCode, role = 'participant' } = req.body;
-    
-    const room = await Room.findOne({ inviteCode: inviteCode.toUpperCase() });
-    
-    if (!room) {
-      return res.status(404).json({ error: 'Invalid invite code' });
+app.post('/api/rooms/join-by-code',
+  getAnonymousId,
+  validateInput([
+    body('inviteCode').trim().isLength({ min: 6, max: 6 }),
+    body('name').trim().isLength({ min: 2, max: 50 }),
+    body('role').optional().isIn(['participant', 'observer'])
+  ]),
+  async (req, res) => {
+    try {
+      const { inviteCode, role = 'participant', name } = req.body;
+
+      const room = await Room.findOne({ inviteCode: inviteCode.toUpperCase() });
+
+      if (!room) {
+        return res.status(404).json({ error: 'Invalid invite code' });
+      }
+
+      if (room.participants.length >= room.maxParticipants) {
+        return res.status(400).json({ error: 'Room is full' });
+      }
+
+      // Check if already in room by anonymousId
+      const existingParticipant = room.participants.find(
+        p => p.anonymousId === req.anonymousId
+      );
+
+      if (existingParticipant) {
+        // Update existing participant (reconnection case)
+        existingParticipant.name = name || existingParticipant.name;
+        existingParticipant.role = role;
+      } else {
+        // Add new participant
+        room.participants.push({
+          name: name || req.userName,
+          anonymousId: req.anonymousId,
+          role
+        });
+      }
+
+      room.lastActivity = new Date();
+      await room.save();
+
+      // Emit updated room data to all users in the room
+      io.to(room._id.toString()).emit('room_updated', {
+        roomId: room._id.toString(),
+        room: room,
+        participants: room.participants
+      });
+
+      res.json(room);
+    } catch (error) {
+      console.error('Join by code error:', error);
+      res.status(500).json({ error: 'Internal server error' });
     }
-
-    if (room.participants.length >= room.maxParticipants) {
-      return res.status(400).json({ error: 'Room is full' });
-    }
-
-    const isAlreadyParticipant = room.participants.some(p => p.userId.toString() === req.user.id);
-    if (isAlreadyParticipant) {
-      return res.status(400).json({ error: 'Already in room' });
-    }
-
-    room.participants.push({ userId: req.user.id, role });
-    await room.save();
-
-    await room.populate('hostId', 'name email');
-    await room.populate('participants.userId', 'name email');
-
-    // Emit updated room data to all users in the room
-    io.to(room._id.toString()).emit('room_updated', {
-      roomId: room._id.toString(),
-      room: room,
-      participants: room.participants
-    });
-
-    res.json(room);
-  } catch (error) {
-    console.error('Join by code error:', error);
-    res.status(500).json({ error: 'Internal server error' });
   }
-});
+);
 
-// Session Routes - Replace the validation part
-app.post('/api/sessions', 
-  authenticateToken,
+// Session Routes
+app.post('/api/sessions',
+  getAnonymousId,
   validateInput([
     body('roomId').isMongoId().withMessage('Invalid room ID'),
     body('topic').trim().isLength({ min: 1, max: 200 }).withMessage('Topic must be 1-200 characters'),
@@ -439,31 +381,34 @@ app.post('/api/sessions',
         return res.status(404).json({ error: 'Room not found' });
       }
 
-      const isParticipant = room.participants.some(p => p.userId.toString() === req.user.id);
-      const isHost = room.hostId.toString() === req.user.id;
-      
-      if (!isParticipant && !isHost) {
+      const isParticipant = room.participants.some(p => p.anonymousId === req.anonymousId);
+
+      if (!isParticipant) {
         return res.status(403).json({ error: 'Access denied' });
       }
 
       // End any active session in this room
       await Session.updateMany(
-        { roomId, isActive: true }, 
+        { roomId, isActive: true },
         { isActive: false, endTime: new Date() }
       );
 
       // Create new session - handle empty topicLink
-      const sessionData = { 
-        roomId, 
+      const sessionData = {
+        roomId,
         topic: topic.trim()
       };
-      
+
       if (topicLink && topicLink.trim()) {
         sessionData.topicLink = topicLink.trim();
       }
-      
+
       const session = new Session(sessionData);
       await session.save();
+
+      // Update room activity
+      room.lastActivity = new Date();
+      await room.save();
 
       console.log('Session created:', session); // Debug log
 
@@ -478,14 +423,15 @@ app.post('/api/sessions',
   }
 );
 
-app.post('/api/sessions/:id/vote', 
-  authenticateToken,
+app.post('/api/sessions/:id/vote',
+  getAnonymousId,
   validateInput([
-    body('vote').notEmpty().withMessage('Vote is required')
+    body('vote').notEmpty().withMessage('Vote is required'),
+    body('name').trim().isLength({ min: 2, max: 50 })
   ]),
   async (req, res) => {
     try {
-      const { vote } = req.body;
+      const { vote, name } = req.body;
       const session = await Session.findById(req.params.id);
 
       if (!session || !session.isActive) {
@@ -494,28 +440,36 @@ app.post('/api/sessions/:id/vote',
 
       // Verify user is in room
       const room = await Room.findById(session.roomId);
-      const participant = room.participants.find(p => p.userId.toString() === req.user.id);
-      
+      const participant = room.participants.find(p => p.anonymousId === req.anonymousId);
+
       if (!participant || participant.role !== 'participant') {
         return res.status(403).json({ error: 'Only participants can vote' });
       }
 
       // Update or add vote
-      const existingVoteIndex = session.votes.findIndex(v => v.userId.toString() === req.user.id);
-      
+      const existingVoteIndex = session.votes.findIndex(v => v.anonymousId === req.anonymousId);
+
       if (existingVoteIndex >= 0) {
         session.votes[existingVoteIndex].vote = vote;
         session.votes[existingVoteIndex].timestamp = new Date();
       } else {
-        session.votes.push({ userId: req.user.id, vote });
+        session.votes.push({
+          participantName: name || participant.name,
+          anonymousId: req.anonymousId,
+          vote
+        });
       }
 
       await session.save();
 
+      // Update room activity
+      room.lastActivity = new Date();
+      await room.save();
+
       // Emit vote update to room
       io.to(session.roomId.toString()).emit('vote_updated', {
         sessionId: session._id,
-        userId: req.user.id,
+        anonymousId: req.anonymousId,
         hasVoted: true
       });
 
@@ -527,20 +481,22 @@ app.post('/api/sessions/:id/vote',
   }
 );
 
-app.post('/api/sessions/:id/reveal', 
-  authenticateToken,
+app.post('/api/sessions/:id/reveal',
+  getAnonymousId,
   async (req, res) => {
     try {
-      const session = await Session.findById(req.params.id).populate('votes.userId', 'name email');
+      const session = await Session.findById(req.params.id);
 
       if (!session || !session.isActive) {
         return res.status(404).json({ error: 'Session not found or inactive' });
       }
 
-      // Verify user is host
+      // Verify user is participant in the room
       const room = await Room.findById(session.roomId);
-      if (room.hostId.toString() !== req.user.id) {
-        return res.status(403).json({ error: 'Only host can reveal votes' });
+      const isParticipant = room.participants.some(p => p.anonymousId === req.anonymousId);
+
+      if (!isParticipant) {
+        return res.status(403).json({ error: 'Access denied' });
       }
 
       // Calculate stats
@@ -549,7 +505,7 @@ app.post('/api/sessions/:id/reveal',
         .filter(vote => !isNaN(vote) && vote !== '?' && vote !== '☕')
         .map(Number);
 
-      const average = numericVotes.length > 0 
+      const average = numericVotes.length > 0
         ? (numericVotes.reduce((sum, vote) => sum + vote, 0) / numericVotes.length).toFixed(1)
         : null;
 
@@ -559,14 +515,18 @@ app.post('/api/sessions/:id/reveal',
       });
 
       const consensus = Object.keys(voteDistribution).length === 1;
-      
+
       // Update session
       session.finalVote = average ? average.toString() : 'No numeric votes';
       session.consensus = consensus;
       session.endTime = new Date();
       session.isActive = false;
-      
+
       await session.save();
+
+      // Update room activity
+      room.lastActivity = new Date();
+      await room.save();
 
       const stats = { average, voteDistribution, consensus };
 
@@ -588,42 +548,63 @@ app.post('/api/sessions/:id/reveal',
 // ===== SOCKET.IO =====
 
 io.use((socket, next) => {
-  const token = socket.handshake.auth.token;
-  
-  if (!token) {
-    return next(new Error('Authentication error'));
+  const userName = socket.handshake.auth.userName;
+  const anonymousId = socket.handshake.auth.anonymousId;
+
+  if (!userName || !anonymousId) {
+    return next(new Error('Name and ID required'));
   }
 
-  jwt.verify(token, process.env.JWT_SECRET, (err, user) => {
-    if (err) return next(new Error('Authentication error'));
-    socket.user = user;
-    next();
-  });
+  socket.userName = userName;
+  socket.anonymousId = anonymousId;
+  next();
 });
 
 io.on('connection', (socket) => {
-  console.log(`User ${socket.user.name} connected`);
+  console.log(`User ${socket.userName} (${socket.anonymousId}) connected`);
 
   socket.on('join_room', async (roomId) => {
+    console.log(`[JOIN_ROOM] ${socket.userName} joining room ${roomId}`);
     socket.join(roomId);
     socket.roomId = roomId;
-    
+
     // Get updated room data and broadcast to all users in room
     try {
-      const room = await Room.findById(roomId)
-        .populate('hostId', 'name email')
-        .populate('participants.userId', 'name email');
-      
+      const room = await Room.findById(roomId);
+
       if (room) {
+        console.log(`[JOIN_ROOM] Room found: ${room.name}, participants: ${room.participants.length}`);
+
+        // Update participant's socket ID for this connection
+        const participant = room.participants.find(p => p.anonymousId === socket.anonymousId);
+
+        if (participant) {
+          console.log(`[JOIN_ROOM] Participant found, updating socketId`);
+          participant.socketId = socket.id;
+          room.lastActivity = new Date();
+          await room.save();
+        } else {
+          console.log(`[JOIN_ROOM] WARNING: Participant ${socket.userName} (${socket.anonymousId}) not found in room!`);
+        }
+
         // Send updated room data to all users in the room
+        console.log(`[JOIN_ROOM] Broadcasting room_updated to ${room.participants.length} participants`);
         io.to(roomId).emit('room_updated', {
           roomId: roomId,
           room: room,
           participants: room.participants
         });
-        
+
         // Also send user connected event
-        socket.to(roomId).emit('user_connected', { user: socket.user });
+        socket.to(roomId).emit('user_connected', {
+          user: {
+            name: socket.userName,
+            anonymousId: socket.anonymousId
+          }
+        });
+        console.log(`[JOIN_ROOM] ${socket.userName} successfully joined room`);
+      } else {
+        console.log(`[JOIN_ROOM] ERROR: Room ${roomId} not found!`);
       }
     } catch (error) {
       console.error('Error updating room on join:', error);
@@ -632,22 +613,47 @@ io.on('connection', (socket) => {
 
   socket.on('leave_room', (roomId) => {
     socket.leave(roomId);
-    socket.to(roomId).emit('user_disconnected', { user: socket.user });
+    socket.to(roomId).emit('user_disconnected', {
+      user: {
+        name: socket.userName,
+        anonymousId: socket.anonymousId
+      }
+    });
   });
 
-  socket.on('disconnect', () => {
-    console.log(`User ${socket.user.name} disconnected`);
+  socket.on('disconnect', async () => {
+    console.log(`User ${socket.userName} disconnected`);
+
     if (socket.roomId) {
-      socket.to(socket.roomId).emit('user_disconnected', { user: socket.user });
+      try {
+        // Clear socket ID from participant
+        const room = await Room.findById(socket.roomId);
+        if (room) {
+          const participant = room.participants.find(p => p.anonymousId === socket.anonymousId);
+          if (participant) {
+            participant.socketId = null;
+            await room.save();
+          }
+        }
+      } catch (error) {
+        console.error('Error updating room on disconnect:', error);
+      }
+
+      socket.to(socket.roomId).emit('user_disconnected', {
+        user: {
+          name: socket.userName,
+          anonymousId: socket.anonymousId
+        }
+      });
     }
   });
 
   // Handle real-time voting
   socket.on('vote_cast', (data) => {
-    console.log(`Vote cast by ${socket.user.name}:`, data);
+    console.log(`Vote cast by ${socket.userName}:`, data);
     socket.to(socket.roomId).emit('vote_updated', {
       sessionId: data.sessionId,
-      userId: socket.user.id,
+      anonymousId: socket.anonymousId,
       hasVoted: true
     });
   });
@@ -662,6 +668,41 @@ app.use((err, req, res, next) => {
 
 app.use('*', (req, res) => {
   res.status(404).json({ error: 'Route not found' });
+});
+
+// ===== ROOM CLEANUP JOB =====
+
+// Room cleanup job - runs every hour
+cron.schedule('0 * * * *', async () => {
+  try {
+    console.log('Running room cleanup job...');
+
+    const expiryThreshold = new Date(Date.now() - 24 * 60 * 60 * 1000); // 24 hours ago
+
+    const result = await Room.updateMany(
+      { isActive: true, lastActivity: { $lt: expiryThreshold } },
+      { isActive: false }
+    );
+
+    console.log(`Deactivated ${result.modifiedCount} inactive rooms`);
+
+    // Also end active sessions in expired rooms
+    if (result.modifiedCount > 0) {
+      const expiredRooms = await Room.find({
+        isActive: false,
+        lastActivity: { $lt: expiryThreshold }
+      }).select('_id');
+
+      const roomIds = expiredRooms.map(r => r._id);
+
+      await Session.updateMany(
+        { roomId: { $in: roomIds }, isActive: true },
+        { isActive: false, endTime: new Date() }
+      );
+    }
+  } catch (error) {
+    console.error('Room cleanup error:', error);
+  }
 });
 
 // ===== START SERVER =====
