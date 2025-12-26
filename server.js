@@ -545,6 +545,92 @@ app.post('/api/sessions/:id/reveal',
   }
 );
 
+// End a session manually (host only)
+app.post('/api/sessions/:id/end',
+  getAnonymousId,
+  async (req, res) => {
+    try {
+      const session = await Session.findById(req.params.id);
+
+      if (!session) {
+        return res.status(404).json({ error: 'Session not found' });
+      }
+
+      if (!session.isActive) {
+        return res.status(400).json({ error: 'Session already ended' });
+      }
+
+      // Get the room to check if user is host
+      const room = await Room.findById(session.roomId);
+      if (!room) {
+        return res.status(404).json({ error: 'Room not found' });
+      }
+
+      // Only host can end session
+      if (room.hostAnonymousId !== req.anonymousId) {
+        return res.status(403).json({ error: 'Only the host can end the session' });
+      }
+
+      // End the session
+      session.isActive = false;
+      session.endTime = new Date();
+      await session.save();
+
+      // Notify all participants
+      io.to(room._id.toString()).emit('session_ended', { sessionId: session._id });
+
+      res.json({ message: 'Session ended', session });
+    } catch (error) {
+      console.error('End session error:', error);
+      res.status(500).json({ error: 'Internal server error' });
+    }
+  }
+);
+
+// Close/deactivate a room (host only)
+app.post('/api/rooms/:id/close',
+  getAnonymousId,
+  async (req, res) => {
+    try {
+      const room = await Room.findById(req.params.id);
+
+      if (!room) {
+        return res.status(404).json({ error: 'Room not found' });
+      }
+
+      // Only host can close room
+      if (room.hostAnonymousId !== req.anonymousId) {
+        return res.status(403).json({ error: 'Only the host can close the room' });
+      }
+
+      if (!room.isActive) {
+        return res.status(400).json({ error: 'Room already closed' });
+      }
+
+      // Deactivate the room
+      room.isActive = false;
+      await room.save();
+
+      // End all active sessions in this room
+      await Session.updateMany(
+        { roomId: room._id, isActive: true },
+        { isActive: false, endTime: new Date() }
+      );
+
+      // Notify all participants
+      io.to(room._id.toString()).emit('room_closed', {
+        roomId: room._id,
+        message: 'This room has been closed by the host'
+      });
+
+      res.json({ message: 'Room closed', room });
+    } catch (error) {
+      console.error('Close room error:', error);
+      res.status(500).json({ error: 'Internal server error' });
+    }
+  }
+);
+
 // ===== SOCKET.IO =====
 
 io.use((socket, next) => {
