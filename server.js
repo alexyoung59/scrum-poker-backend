@@ -602,6 +602,27 @@ io.on('connection', (socket) => {
             anonymousId: socket.anonymousId
           }
         });
+
+        // Check if there's an active session in this room and send it to the joining user
+        const activeSession = await Session.findOne({
+          roomId: roomId,
+          isActive: true
+        });
+
+        if (activeSession) {
+          console.log(`[JOIN_ROOM] Active session found, sending to ${socket.userName}`);
+          socket.emit('session_started', activeSession);
+
+          // If votes have been revealed, also send the current vote state
+          if (activeSession.votes && activeSession.votes.length > 0) {
+            const votesRevealed = activeSession.votes.some(v => v.vote !== undefined);
+            if (votesRevealed) {
+              console.log(`[JOIN_ROOM] Sending revealed votes to ${socket.userName}`);
+              socket.emit('votes_revealed', { votes: activeSession.votes });
+            }
+          }
+        }
+
         console.log(`[JOIN_ROOM] ${socket.userName} successfully joined room`);
       } else {
         console.log(`[JOIN_ROOM] ERROR: Room ${roomId} not found!`);
