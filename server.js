@@ -96,6 +96,7 @@ const roomSchema = new mongoose.Schema({
   hostName: { type: String, required: true },
   hostAnonymousId: { type: String, required: true },
   hostSocketId: { type: String },
+  password: { type: String, required: true }, // Hashed password (bcrypt)
   participants: [{
     name: { type: String, required: true },
     socketId: { type: String },
@@ -171,15 +172,12 @@ const generateInviteCode = () => {
 // Room Routes
 app.get('/api/rooms', getAnonymousId, async (req, res) => {
   try {
-    // Get all active rooms or filter by user's anonymousId if requested
-    const query = req.query.myRooms === 'true'
-      ? {
-          isActive: true,
-          'participants.anonymousId': req.anonymousId
-        }
-      : { isActive: true };
-
-    const rooms = await Room.find(query)
+    // ONLY return rooms where user is a participant (all rooms are password-protected)
+    const rooms = await Room.find({
+      isActive: true,
+      'participants.anonymousId': req.anonymousId
+    })
+      .select('-password') // Never return hashed password
       .sort({ lastActivity: -1, createdAt: -1 });
 
     res.json(rooms);
@@ -194,17 +192,22 @@ app.post('/api/rooms',
   validateInput([
     body('name').trim().isLength({ min: 3, max: 100 }),
     body('description').optional().trim().isLength({ max: 500 }),
-    body('hostName').trim().isLength({ min: 2, max: 50 })
+    body('hostName').trim().isLength({ min: 2, max: 50 }),
+    body('password').trim().isLength({ min: 4, max: 100 }).withMessage('Password must be 4-100 characters')
   ]),
   async (req, res) => {
     try {
-      const { name, description, hostName } = req.body;
+      const { name, description, hostName, password } = req.body;
+
+      // Hash the password
+      const hashedPassword = await bcrypt.hash(password, 10);
 
       const room = new Room({
         name,
         description,
         hostName: hostName || req.userName,
         hostAnonymousId: req.anonymousId,
+        password: hashedPassword,
         participants: [{
           name: hostName || req.userName,
           anonymousId: req.anonymousId,
@@ -216,7 +219,12 @@ app.post('/api/rooms',
 
       await room.save();
 
-      res.status(201).json(room);
+      // Return room without hashed password, but include the plain password for the host
+      const roomResponse = room.toObject();
+      roomResponse.plainPassword = password; // Send back for host to share
+      delete roomResponse.password; // Don't send hashed password
+
+      res.status(201).json(roomResponse);
     } catch (error) {
       console.error('Create room error:', error);
       res.status(500).json({ error: 'Internal server error' });
@@ -247,25 +255,34 @@ app.post('/api/rooms/:id/join',
   getAnonymousId,
   validateInput([
     body('name').trim().isLength({ min: 2, max: 50 }),
+    body('password').trim().notEmpty().withMessage('Password is required'),
     body('role').optional().isIn(['participant', 'observer'])
   ]),
   async (req, res) => {
     try {
-      const { role = 'participant', name } = req.body;
+      const { role = 'participant', name, password } = req.body;
       const room = await Room.findById(req.params.id);
 
       if (!room) {
         return res.status(404).json({ error: 'Room not found' });
       }
 
-      if (room.participants.length >= room.maxParticipants) {
-        return res.status(400).json({ error: 'Room is full' });
-      }
-
       // Check if already in room by anonymousId
       const existingParticipant = room.participants.find(
         p => p.anonymousId === req.anonymousId
       );
+
+      // If not already a participant, validate password
+      if (!existingParticipant) {
+        const isValidPassword = await bcrypt.compare(password, room.password);
+        if (!isValidPassword) {
+          return res.status(403).json({ error: 'Incorrect password' });
+        }
+      }
+
+      if (room.participants.length >= room.maxParticipants && !existingParticipant) {
+        return res.status(400).json({ error: 'Room is full' });
+      }
 
       if (existingParticipant) {
         // Update existing participant (reconnection case)
@@ -290,7 +307,11 @@ app.post('/api/rooms/:id/join',
         participants: room.participants
       });
 
-      res.json({ message: 'Joined room successfully', room });
+      // Return room without password
+      const roomResponse = room.toObject();
+      delete roomResponse.password;
+
+      res.json({ message: 'Joined room successfully', room: roomResponse });
     } catch (error) {
       console.error('Join room error:', error);
       res.status(500).json({ error: 'Internal server error' });
@@ -303,11 +324,12 @@ app.post('/api/rooms/join-by-code',
   validateInput([
     body('inviteCode').trim().isLength({ min: 6, max: 6 }),
     body('name').trim().isLength({ min: 2, max: 50 }),
+    body('password').trim().notEmpty().withMessage('Password is required'),
     body('role').optional().isIn(['participant', 'observer'])
   ]),
   async (req, res) => {
     try {
-      const { inviteCode, role = 'participant', name } = req.body;
+      const { inviteCode, role = 'participant', name, password } = req.body;
 
       const room = await Room.findOne({ inviteCode: inviteCode.toUpperCase() });
 
@@ -315,14 +337,22 @@ app.post('/api/rooms/join-by-code',
         return res.status(404).json({ error: 'Invalid invite code' });
       }
 
-      if (room.participants.length >= room.maxParticipants) {
-        return res.status(400).json({ error: 'Room is full' });
-      }
-
       // Check if already in room by anonymousId
       const existingParticipant = room.participants.find(
         p => p.anonymousId === req.anonymousId
       );
+
+      // If not already a participant, validate password
+      if (!existingParticipant) {
+        const isValidPassword = await bcrypt.compare(password, room.password);
+        if (!isValidPassword) {
+          return res.status(403).json({ error: 'Incorrect password' });
+        }
+      }
+
+      if (room.participants.length >= room.maxParticipants && !existingParticipant) {
+        return res.status(400).json({ error: 'Room is full' });
+      }
 
       if (existingParticipant) {
         // Update existing participant (reconnection case)
@@ -347,7 +377,11 @@ app.post('/api/rooms/join-by-code',
         participants: room.participants
       });
 
-      res.json(room);
+      // Return room without password
+      const roomResponse = room.toObject();
+      delete roomResponse.password;
+
+      res.json(roomResponse);
     } catch (error) {
       console.error('Join by code error:', error);
       res.status(500).json({ error: 'Internal server error' });

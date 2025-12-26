@@ -1,0 +1,34 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(gh:*)",
+      "Bash(ls:*)",
+      "Bash(git -C \"C:\\\\Users\\\\alexy\\\\scrum-poker-frontend\" log --oneline -20)",
+      "Bash(git -C \"C:\\\\Users\\\\alexy\\\\scrum-poker-frontend\" status)",
+      "Bash(cat:*)",
+      "Bash(dir:*)",
+      "Bash(git -C \"C:\\\\users\\\\alexy\\\\scrum-poker-backend\" check-ignore .env)",
+      "Bash(npm start)",
+      "Bash(netstat:*)",
+      "Bash(findstr:*)",
+      "Bash(taskkill:*)",
+      "Bash(powershell -Command \"Stop-Process -Id 24204 -Force\")",
+      "Bash(powershell -Command \"Get-Process node | Where-Object {$_MainWindowTitle -eq ''''} | Stop-Process -Force\")",
+      "Bash(tasklist:*)",
+      "Bash(tskill:*)",
+      "Bash(powershell -Command \"Stop-Process -Id 18684 -Force\")",
+      "Bash(powershell -Command \"Stop-Process -Id 6792 -Force\")",
+      "Bash(powershell -Command \"Stop-Process -Id 24752 -Force\")",
+      "Bash(powershell -Command \"Get-Process | Where-Object {$_ProcessName -eq ''node''} | Select-Object Id, ProcessName | Format-Table\")",
+      "Bash(cmd //c \"taskkill /F /PID 42696\")",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git push:*)",
+      "Bash(git checkout:*)",
+      "Bash(git merge:*)",
+      "Bash(git restore:*)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}
