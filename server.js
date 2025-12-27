@@ -8,6 +8,7 @@ const mongoose = require('mongoose');
 const cron = require('node-cron');
 const rateLimit = require('express-rate-limit');
 const { body, validationResult } = require('express-validator');
+const bcrypt = require('bcrypt');
 require('dotenv').config();
 
 const app = express();
@@ -574,6 +575,78 @@ app.post('/api/sessions/:id/reveal',
       res.json({ session, stats });
     } catch (error) {
       console.error('Reveal votes error:', error);
+      res.status(500).json({ error: 'Internal server error' });
+    }
+  }
+);
+
+// Update session topic (host only) - allows changing topic without ending session
+app.post('/api/sessions/:id/update-topic',
+  getAnonymousId,
+  validateInput([
+    body('topic').trim().isLength({ min: 1, max: 200 }).withMessage('Topic must be 1-200 characters'),
+    body('topicLink').optional().custom((value) => {
+      if (!value || value.trim() === '') return true;
+      try {
+        new URL(value);
+        return true;
+      } catch {
+        throw new Error('Invalid URL format');
+      }
+    }),
+    body('resetVotes').optional().isBoolean()
+  ]),
+  async (req, res) => {
+    try {
+      const { topic, topicLink, resetVotes = true } = req.body;
+      const session = await Session.findById(req.params.id);
+
+      if (!session) {
+        return res.status(404).json({ error: 'Session not found' });
+      }
+
+      if (!session.isActive) {
+        return res.status(400).json({ error: 'Cannot update ended session' });
+      }
+
+      // Get the room to check if user is host
+      const room = await Room.findById(session.roomId);
+      if (!room) {
+        return res.status(404).json({ error: 'Room not found' });
+      }
+
+      // Only host can update topic
+      if (room.hostAnonymousId !== req.anonymousId) {
+        return res.status(403).json({ error: 'Only the host can update the topic' });
+      }
+
+      // Update the topic
+      session.topic = topic.trim();
+      if (topicLink !== undefined) {
+        session.topicLink = topicLink && topicLink.trim() ? topicLink.trim() : undefined;
+      }
+
+      // Reset votes if requested (default behavior)
+      if (resetVotes) {
+        session.votes = [];
+      }
+
+      await session.save();
+
+      // Update room activity
+      room.lastActivity = new Date();
+      await room.save();
+
+      // Notify all participants about the topic update
+      io.to(room._id.toString()).emit('session_updated', {
+        sessionId: session._id,
+        session: session,
+        resetVotes: resetVotes
+      });
+
+      res.json({ message: 'Topic updated', session });
+    } catch (error) {
+      console.error('Update topic error:', error);
       res.status(500).json({ error: 'Internal server error' });
     }
   }
