@@ -551,11 +551,11 @@ app.post('/api/sessions/:id/reveal',
 
       const consensus = Object.keys(voteDistribution).length === 1;
 
-      // Update session
+      // Update session stats (but keep session active for re-voting)
       session.finalVote = average ? average.toString() : 'No numeric votes';
       session.consensus = consensus;
-      session.endTime = new Date();
-      session.isActive = false;
+      // Note: Don't set isActive=false here - revealing votes doesn't end the session
+      // The session can be reset for re-voting or ended explicitly via "End Session"
 
       await session.save();
 
@@ -870,6 +870,31 @@ io.on('connection', (socket) => {
       anonymousId: socket.anonymousId,
       hasVoted: true
     });
+  });
+
+  // Handle vote reset
+  socket.on('reset_votes', async (data) => {
+    console.log(`Vote reset requested by ${socket.userName} for session:`, data.sessionId);
+
+    try {
+      const session = await Session.findById(data.sessionId);
+      if (session && session.isActive) {
+        // Clear votes in database
+        session.votes = [];
+        session.finalVote = null;
+        session.consensus = null;
+        await session.save();
+
+        console.log(`Votes cleared for session ${data.sessionId}`);
+
+        // Broadcast reset to all participants in the room
+        io.to(socket.roomId).emit('votes_reset', {
+          sessionId: data.sessionId
+        });
+      }
+    } catch (error) {
+      console.error('Error resetting votes:', error);
+    }
   });
 });
 
